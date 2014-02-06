@@ -4,38 +4,33 @@
 {% block head %}
 <script>
 
-	$(function () {
-		$(".minibutton").each(function() {
-			$(this).click(function(e) {
-				var tr = $(this).parent().parent();
-				var vrf_id = tr.attr('data-vrf-id');
-				var vrf_rt = tr.children('td:first').text();
-				var menu = getPopupMenu($(this), 'VRF', vrf_id);
+/*
+    function showVrfMenu(vrf_id, vrf_rt) {
+        var menu = getPopupMenu($(this), 'VRF', vrf_id);
 
-				menu.append('<a href="/vrf/edit/' + vrf_id + '">Edit</a>');
-				menu.append('<a id="vrf_remove' + vrf_id + '" href="/vrf/remove/' + vrf_id + '">Remove</a>');
+        menu.append('<a href="/vrf/edit/' + vrf_id + '">Edit</a>');
+        menu.append('<a id="vrf_remove' + vrf_id + '" href="/vrf/remove/' + vrf_id + '">Remove</a>');
 
-				$('#vrf_remove' + vrf_id).click(function(e) {
-					e.preventDefault();
-					var dialog = showDialogYesNo('Really remove VRF?', 'Are you sure you want to remove the VRF "' + vrf_rt + '"?',
-					function () {
-						var data = {
-							'id': vrf_id
-						};
-						$.getJSON('/xhr/remove_vrf', data, vrfRemoved);
+        $('#vrf_remove' + vrf_id).click(function(e) {
+            e.preventDefault();
+            var dialog = showDialogYesNo('Really remove VRF?', 'Are you sure you want to remove the VRF "' + vrf_rt + '"?',
+            function () {
+                var data = {
+                    'id': vrf_id
+                };
+                $.getJSON('/xhr/remove_vrf', data, vrfRemoved);
 
-						hidePopupMenu();
-						dialog.dialog('close');
+                hidePopupMenu();
+                dialog.dialog('close');
 
-					});
-				});
+            });
+        });
 
-				menu.slideDown('fast');
-				e.preventDefault();
-				e.stopPropagation();
-			});
-		});
-	});
+        menu.slideDown('fast');
+        e.preventDefault();
+        e.stopPropagation();
+    }
+    */
 
 	/*
 	* Callback function after a vrf has been removed
@@ -50,6 +45,8 @@
 
 </script>
 {% endblock %}
+
+{% block body_attributes %}ng-controller="VRFListController"{% endblock %}
 
 {% block content %}
 
@@ -66,6 +63,9 @@
 	</div>
 </div>
 
+<div style="text-align: center; padding: 30px;">
+    <label>Search: <input type="text" ng-model="query"></label>
+</div>
 
 <table style="border-spacing: 0px; width: 100%;">
 	<thead class="listing">
@@ -74,18 +74,16 @@
 		</tr>
 	</thead>
 	<tbody class="listing">
-		{% for vrf in c.vrfs %}
-		<tr id="vrf_row{{ vrf.id }}" data-vrf-id="{{vrf.id}}">
-			<td style="padding-left: 30px;">{{ vrf.rt }}</a></td>
-		<td>{{ vrf.name or '' }}</td>
-		<td>{{ vrf.description or '' }}</td>
-		<td>
-			<div id="vrf_button{{vrf.id}}" class="minibutton">
-				<div class="popup_button_icon">&nbsp;</div>
-			</div>
-		</td>
-	</tr>
-	{% endfor %}
-</tbody>
+		<tr ng-repeat="vrf in vrfs | filter:query">
+			<td style="padding-left: 30px;">{{ '{{' }} vrf.rt {{ '}}' }}</a></td>
+			<td>{{ '{{' }} vrf.name {{ '}}' }}</td>
+			<td>{{ '{{' }} vrf.description {{ '}}' }}</td>
+			<td>
+				<div ng-click="showVrfMenu(vrf.id, vrf.rt)" class="minibutton">
+					<div class="popup_button_icon">&nbsp;</div>
+				</div>
+			</td>
+		</tr>
+	</tbody>
 </table>
 {% endblock %}
