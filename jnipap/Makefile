@@ -1,7 +1,7 @@
 default: jar
 
 jar:
-	gradlew jar
+	gradle jar
 	cp build/libs/jnipap.jar .
 
 test:
