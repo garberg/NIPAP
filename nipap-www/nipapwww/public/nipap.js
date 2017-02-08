@@ -1002,7 +1002,7 @@ function receiveVRFSelector(result) {
 
 	// place search result in VRF container
 	if (result.result.length > 0) {
-		for (i = 0; i < result.result.length; i++) {
+		for (var i = 0; i < result.result.length; i++) {
 
 			var vrf = result.result[i];
 
@@ -1529,7 +1529,7 @@ function insertPrefixList(pref_list) {
 	}
 
 	// iterate received prefixes
-	for (i = 1; i < pref_list.length; i++) {
+	for (var i = 1; i < pref_list.length; i++) {
 
 		// Add prefix to global prefix list object if it's not already there
 		prefix = pref_list[i];
@@ -1629,7 +1629,7 @@ function insertPrefix(prefix, prev_prefix) {
 		 */
 		main_container = $("#prefix_entry" + prev_prefix.id);
 		vrf_container = getVRFContainer(prefix.vrf_id);
-		for (i = prev_prefix.indent - prefix.indent; i > 0; i--) {
+		for (var i = prev_prefix.indent - prefix.indent; i > 0; i--) {
 			main_container = main_container.parent();
 
 			// The previous prefix on our level might have been placed into a
@@ -2203,7 +2203,7 @@ function populatePoolTable(data) {
 
 	var pool_table_data = [];
 
-	for (key in data) {
+	for (var key in data) {
 
 		// Save pool object to pool list
 		pool_list[data[key].id] = data[key];
