@@ -10,14 +10,15 @@ import logging
 import time
 import pytz
 from functools import wraps
-from flask import Flask
+from flask import Flask, current_app
 from flask import request, Response
-from flaskext.xmlrpc import XMLRPCHandler, Fault
+from flask_xmlrpcre.xmlrpcre import XMLRPCHandler, Fault
+from flask_compress import Compress
 
-from nipapconfig import NipapConfig
-from backend import Nipap, NipapError
+from .nipapconfig import NipapConfig
+from .backend import Nipap, NipapError
 import nipap
-from authlib import AuthFactory, AuthError
+from .authlib import AuthFactory, AuthError
 
 
 def setup(app):
@@ -29,14 +30,13 @@ def setup(app):
     return app
 
 
-
 def _mangle_prefix(res):
     """ Mangle prefix result
     """
     # fugly cast from large numbers to string to deal with XML-RPC
-    res['total_addresses'] = unicode(res['total_addresses'])
-    res['used_addresses'] = unicode(res['used_addresses'])
-    res['free_addresses'] = unicode(res['free_addresses'])
+    res['total_addresses'] = str(res['total_addresses'])
+    res['used_addresses'] = str(res['used_addresses'])
+    res['free_addresses'] = str(res['free_addresses'])
 
     # postgres has notion of infinite while datetime hasn't, if expires
     # is equal to the max datetime we assume it is infinity and instead
@@ -62,11 +62,11 @@ def requires_auth(f):
     """ Class decorator for XML-RPC functions that requires auth
     """
     @wraps(f)
-
     def decorated(self, *args, **kwargs):
         """
         """
 
+        self.logger.debug("authenticating call with args %s and kwargs %s", args, kwargs)
         # Fetch auth options from args
         auth_options = {}
         nipap_args = {}
@@ -75,18 +75,18 @@ def requires_auth(f):
         if len(args) == 1:
             nipap_args = args[0]
         else:
-            self.logger.debug("Malformed request: got %d parameters" % len(args))
-            raise Fault(1000, ("NIPAP API functions take exactly 1 argument (%d given)") % len(args))
+            self.logger.debug("Malformed request: got %s parameters", len(args))
+            raise Fault(1000, "NIPAP API functions take exactly 1 argument ({} given)".format(len(args)))
 
-        if type(nipap_args) != dict:
+        if not isinstance(nipap_args, dict):
             self.logger.debug("Function argument is not struct")
-            raise Fault(1000, ("Function argument must be XML-RPC struct/Python dict (Python %s given)." %
-                type(nipap_args).__name__ ))
+            raise Fault(1000, ("Function argument must be XML-RPC struct/Python dict (Python {} given).".format(
+                type(nipap_args).__name__ )))
 
         # fetch auth options
         try:
             auth_options = nipap_args['auth']
-            if type(auth_options) is not dict:
+            if not isinstance(auth_options, dict):
                 raise ValueError()
         except (KeyError, ValueError):
             self.logger.debug("Missing/invalid authentication options in request.")
@@ -102,24 +102,66 @@ def requires_auth(f):
         if not request.authorization:
             return authenticate()
 
-        # init AuthFacory()
-        af = AuthFactory()
-        auth = af.get_auth(request.authorization.username,
-                request.authorization.password, auth_source, auth_options or {})
+        self.logger.debug('About to initialize auth factory..')
+        try:
+            # init AuthFacory()
+            af = AuthFactory()
+            auth = af.get_auth(request.authorization.username,
+                    request.authorization.password, auth_source, auth_options or {})
 
-        # authenticated?
-        if not auth.authenticate():
-            self.logger.debug("Incorrect username or password.")
-            raise Fault(1510, ("Incorrect username or password."))
+            # authenticated?
+            if not auth.authenticate():
+                self.logger.debug("Incorrect username or password.")
+                raise Fault(1510, ("Incorrect username or password."))
 
-        # Replace auth options in API call arguments with auth object
-        new_args = dict(args[0])
-        new_args['auth'] = auth
+            # Replace auth options in API call arguments with auth object
+            new_args = dict(args[0])
+            new_args['auth'] = auth
 
-        return f(self, *(new_args,), **kwargs)
+            self.logger.debug('Call authenticated - calling.. with new_args: %s', new_args)
+            return f(self, *(new_args,), **kwargs)
+        except Exception as e:
+            self.logger.exception(e)
+            raise e
 
     return decorated
 
+
+def xmlrpc_bignum2str(res, keys=['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses']):
+    """
+    Cast from large numbers to string to deal with XML-RPC -
+    Performance seems equivalent to preexisting blocks, and improves readability IMO
+    Since targeted keys (quantity) all start with ['num_', 'total_', 'used_', 'free_'] a different version was tried
+    using .startswith(), however this proved less performing..
+
+    :param dict[str, dict] res: psql result to cast
+    :param list[str] keys: list of keys to cast to string if required
+    :rtype: dict[str, dict]
+    """
+    if isinstance(res, dict):
+        if 'result' in res:
+            for entry in res['result']:
+                for v in ['_v4', '_v6']:
+                    for key in [k+v for k in keys]:
+                        if entry[key] is not None and not isinstance(entry[key], str):
+                            entry[key] = str(entry[key])
+        elif 'id' in res:
+            for v in ['_v4', '_v6']:
+                for key in [k + v for k in keys]:
+                    if res[key] is not None and not isinstance(res[key], str):
+                        res[key] = str(res[key])
+        else:
+            raise ValueError('Illegal result: {}'.format(res))
+
+    elif isinstance(res, list):
+        for entry in res:
+            for v in ['_v4', '_v6']:
+                for key in [k+v for k in keys]:
+                    if entry[key] is not None and not isinstance(entry[key], str):
+                        entry[key] = str(entry[key])
+    else:
+        raise ValueError('Illegal result: {}'.format(res))
+    return res
 
 
 class NipapXMLRPC:
@@ -128,8 +170,7 @@ class NipapXMLRPC:
     def __init__(self):
         self.nip = Nipap()
         self.logger = logging.getLogger()
-
-
+        self.logger.setLevel(logging.DEBUG)
 
     @requires_auth
     def echo(self, args):
@@ -154,8 +195,6 @@ class NipapXMLRPC:
         if args.get('message') is not None:
             return args.get('message')
 
-
-
     @requires_auth
     def version(self, args):
         """ Returns nipapd version
@@ -164,8 +203,6 @@ class NipapXMLRPC:
         """
         return nipap.__version__
 
-
-
     @requires_auth
     def db_version(self, args):
         """ Returns schema version of nipap psql db
@@ -173,8 +210,6 @@ class NipapXMLRPC:
             Returns a string.
         """
         return self.nip._get_db_version()
-
-
 
     #
     # VRF FUNCTIONS
@@ -194,20 +229,12 @@ class NipapXMLRPC:
         """
         try:
             res = self.nip.add_vrf(args.get('auth'), args.get('attr'))
-
             # fugly cast from large numbers to string to deal with XML-RPC
-            for val in ( 'num_prefixes_v4', 'num_prefixes_v6',
-                'total_addresses_v4', 'total_addresses_v6',
-                'used_addresses_v4', 'used_addresses_v6', 'free_addresses_v4',
-                'free_addresses_v6'):
-                res[val] = unicode(res[val])
-
+            res = xmlrpc_bignum2str(res, ['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses'])
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def remove_vrf(self, args):
@@ -223,14 +250,12 @@ class NipapXMLRPC:
         try:
             self.nip.remove_vrf(args.get('auth'), args.get('vrf'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def list_vrf(self, args):
-        """ List VRFs.
+        """List VRFs.
 
             Valid keys in the `args`-struct:
 
@@ -245,19 +270,12 @@ class NipapXMLRPC:
             res = self.nip.list_vrf(args.get('auth'), args.get('vrf'))
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for vrf in res:
-                for val in ( 'num_prefixes_v4', 'num_prefixes_v6',
-                    'total_addresses_v4', 'total_addresses_v6',
-                    'used_addresses_v4', 'used_addresses_v6', 'free_addresses_v4',
-                    'free_addresses_v6'):
-                    vrf[val] = unicode(vrf[val])
+            res = xmlrpc_bignum2str(res, ['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def edit_vrf(self, args):
@@ -276,19 +294,12 @@ class NipapXMLRPC:
             res = self.nip.edit_vrf(args.get('auth'), args.get('vrf'), args.get('attr'))
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for vrf in res:
-                for val in ( 'num_prefixes_v4', 'num_prefixes_v6',
-                    'total_addresses_v4', 'total_addresses_v6',
-                    'used_addresses_v4', 'used_addresses_v6', 'free_addresses_v4',
-                    'free_addresses_v6'):
-                    vrf[val] = unicode(vrf[val])
+            res = xmlrpc_bignum2str(res, ['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def search_vrf(self, args):
@@ -311,19 +322,12 @@ class NipapXMLRPC:
             res = self.nip.search_vrf(args.get('auth'), args.get('query'), args.get('search_options') or {})
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for vrf in res['result']:
-                for val in ( 'num_prefixes_v4', 'num_prefixes_v6',
-                    'total_addresses_v4', 'total_addresses_v6',
-                    'used_addresses_v4', 'used_addresses_v6', 'free_addresses_v4',
-                    'free_addresses_v6'):
-                    vrf[val] = unicode(vrf[val])
+            res = xmlrpc_bignum2str(res, ['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def smart_search_vrf(self, args):
@@ -343,24 +347,20 @@ class NipapXMLRPC:
             search string and the search options used.
         """
         try:
-            res = self.nip.smart_search_vrf(args.get('auth'),
-                    args.get('query_string'), args.get('search_options', {}),
-                    args.get('extra_query'))
+            res = self.nip.smart_search_vrf(
+                args.get('auth'),
+                args.get('query_string'),
+                args.get('search_options', {}),
+                args.get('extra_query'),
+            )
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for vrf in res['result']:
-                for val in ( 'num_prefixes_v4', 'num_prefixes_v6',
-                    'total_addresses_v4', 'total_addresses_v6',
-                    'used_addresses_v4', 'used_addresses_v6', 'free_addresses_v4',
-                    'free_addresses_v6'):
-                    vrf[val] = unicode(vrf[val])
+            res = xmlrpc_bignum2str(res, ['num_prefixes', 'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     #
     # POOL FUNCTIONS
@@ -382,22 +382,13 @@ class NipapXMLRPC:
             res = self.nip.add_pool(args.get('auth'), args.get('attr'))
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for val in ( 'member_prefixes_v4', 'member_prefixes_v6',
-                    'used_prefixes_v4', 'used_prefixes_v6', 'free_prefixes_v4',
-                    'free_prefixes_v6', 'total_prefixes_v4',
-                    'total_prefixes_v6', 'total_addresses_v4',
-                    'total_addresses_v6', 'used_addresses_v4',
-                    'used_addresses_v6', 'free_addresses_v4',
-                    'free_addresses_v6'):
-                if res[val] is not None:
-                    res[val] = unicode(res[val])
+            res = xmlrpc_bignum2str(res, ['member_prefixes', 'used_prefixes', 'free_prefixes', 'total_prefixes',
+                                          'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def remove_pool(self, args):
@@ -413,10 +404,8 @@ class NipapXMLRPC:
         try:
             self.nip.remove_pool(args.get('auth'), args.get('pool'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def list_pool(self, args):
@@ -435,23 +424,13 @@ class NipapXMLRPC:
             res = self.nip.list_pool(args.get('auth'), args.get('pool'))
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for pool in res:
-                for val in ( 'member_prefixes_v4', 'member_prefixes_v6',
-                        'used_prefixes_v4', 'used_prefixes_v6',
-                        'free_prefixes_v4', 'free_prefixes_v6',
-                        'total_prefixes_v4', 'total_prefixes_v6',
-                        'total_addresses_v4', 'total_addresses_v6',
-                        'used_addresses_v4', 'used_addresses_v6',
-                        'free_addresses_v4', 'free_addresses_v6'):
-                    if pool[val] is not None:
-                        pool[val] = unicode(pool[val])
+            res = xmlrpc_bignum2str(res, ['member_prefixes', 'used_prefixes', 'free_prefixes', 'total_prefixes',
+                                          'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def edit_pool(self, args):
@@ -470,23 +449,13 @@ class NipapXMLRPC:
             res = self.nip.edit_pool(args.get('auth'), args.get('pool'), args.get('attr'))
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for pool in res:
-                for val in ( 'member_prefixes_v4', 'member_prefixes_v6',
-                        'used_prefixes_v4', 'used_prefixes_v6', 'free_prefixes_v4',
-                        'free_prefixes_v6', 'total_prefixes_v4',
-                        'total_prefixes_v6', 'total_addresses_v4',
-                        'total_addresses_v6', 'used_addresses_v4',
-                        'used_addresses_v6', 'free_addresses_v4',
-                        'free_addresses_v6'):
-                    if pool[val] is not None:
-                        pool[val] = unicode(pool[val])
+            res = xmlrpc_bignum2str(res, ['member_prefixes', 'used_prefixes', 'free_prefixes', 'total_prefixes',
+                                          'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def search_pool(self, args):
@@ -509,23 +478,13 @@ class NipapXMLRPC:
             res = self.nip.search_pool(args.get('auth'), args.get('query'), args.get('search_options') or {})
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for pool in res['result']:
-                for val in ( 'member_prefixes_v4', 'member_prefixes_v6',
-                        'used_prefixes_v4', 'used_prefixes_v6',
-                        'free_prefixes_v4', 'free_prefixes_v6',
-                        'total_prefixes_v4', 'total_prefixes_v6',
-                        'total_addresses_v4', 'total_addresses_v6',
-                        'used_addresses_v4', 'used_addresses_v6',
-                        'free_addresses_v4', 'free_addresses_v6'):
-                    if pool[val] is not None:
-                        pool[val] = unicode(pool[val])
+            res = xmlrpc_bignum2str(res, ['member_prefixes', 'used_prefixes', 'free_prefixes', 'total_prefixes',
+                                          'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def smart_search_pool(self, args):
@@ -545,28 +504,21 @@ class NipapXMLRPC:
             query string and the search options used.
         """
         try:
-            res = self.nip.smart_search_pool(args.get('auth'),
-                    args.get('query_string'), args.get('search_options') or {},
-                    args.get('extra_query'))
+            res = self.nip.smart_search_pool(
+                args.get('auth'),
+                args.get('query_string'),
+                args.get('search_options') or {},
+                args.get('extra_query'),
+            )
 
             # fugly cast from large numbers to string to deal with XML-RPC
-            for pool in res['result']:
-                for val in ( 'member_prefixes_v4', 'member_prefixes_v6',
-                        'used_prefixes_v4', 'used_prefixes_v6',
-                        'free_prefixes_v4', 'free_prefixes_v6',
-                        'total_prefixes_v4', 'total_prefixes_v6',
-                        'total_addresses_v4', 'total_addresses_v6',
-                        'used_addresses_v4', 'used_addresses_v6',
-                        'free_addresses_v4', 'free_addresses_v6'):
-                    if pool[val] is not None:
-                        pool[val] = unicode(pool[val])
+            res = xmlrpc_bignum2str(res, ['member_prefixes', 'used_prefixes', 'free_prefixes', 'total_prefixes',
+                                          'total_addresses', 'used_addresses', 'free_addresses'])
 
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     #
     # PREFIX FUNCTIONS
@@ -593,10 +545,8 @@ class NipapXMLRPC:
             res = _mangle_prefix(res)
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def list_prefix(self, args):
@@ -621,14 +571,12 @@ class NipapXMLRPC:
                 prefix = _mangle_prefix(prefix)
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def edit_prefix(self, args):
-        """ Edit prefix.
+        """Edit prefix.
 
             Valid keys in the `args`-struct:
 
@@ -637,7 +585,7 @@ class NipapXMLRPC:
             * `prefix` [struct]
                 Prefix attributes which describes what prefix(es) to edit.
             * `attr` [struct]
-                Attribuets to set on the new prefix.
+                Attributes to set on the new prefix.
         """
         try:
             res = self.nip.edit_prefix(args.get('auth'), args.get('prefix'), args.get('attr'))
@@ -646,10 +594,8 @@ class NipapXMLRPC:
                 prefix = _mangle_prefix(prefix)
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def remove_prefix(self, args):
@@ -667,10 +613,8 @@ class NipapXMLRPC:
         try:
             return self.nip.remove_prefix(args.get('auth'), args.get('prefix'), args.get('recursive'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def search_prefix(self, args):
@@ -699,10 +643,8 @@ class NipapXMLRPC:
                 prefix = _mangle_prefix(prefix)
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def smart_search_prefix(self, args):
@@ -729,17 +671,23 @@ class NipapXMLRPC:
         """
 
         try:
-            res = self.nip.smart_search_prefix(args.get('auth'),
-                    args.get('query_string'), args.get('search_options') or {},
-                    args.get('extra_query'))
+            self.logger.debug('Entering ssp')
+            res = self.nip.smart_search_prefix(
+                args.get('auth'),
+                args.get('query_string'),
+                args.get('search_options') or {},
+                args.get('extra_query'),
+            )
             # mangle result
             for prefix in res['result']:
                 prefix = _mangle_prefix(prefix)
             return res
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
+            self.logger.debug(str(exc))
+            self.logger.exception('unhandled..', exc)
+            raise Fault(exc.error_code, str(exc))
+        except Exception as e:
+            self.logger.exception('unhandled..', e)
 
 
     @requires_auth
@@ -758,10 +706,8 @@ class NipapXMLRPC:
         try:
             return self.nip.find_free_prefix(args.get('auth'), args.get('vrf'), args.get('args'))
         except NipapError as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     #
     # ASN FUNCTIONS
@@ -783,10 +729,8 @@ class NipapXMLRPC:
         try:
             return self.nip.add_asn(args.get('auth'), args.get('attr'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def remove_asn(self, args):
@@ -803,10 +747,8 @@ class NipapXMLRPC:
         try:
             self.nip.remove_asn(args.get('auth'), args.get('asn'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def list_asn(self, args):
@@ -825,10 +767,8 @@ class NipapXMLRPC:
         try:
             return self.nip.list_asn(args.get('auth'), args.get('asn') or {})
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def edit_asn(self, args):
@@ -847,10 +787,8 @@ class NipapXMLRPC:
         try:
             return self.nip.edit_asn(args.get('auth'), args.get('asn'), args.get('attr'))
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def search_asn(self, args):
@@ -873,10 +811,8 @@ class NipapXMLRPC:
         try:
             return self.nip.search_asn(args.get('auth'), args.get('query'), args.get('search_options') or {})
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
     @requires_auth
     def smart_search_asn(self, args):
@@ -897,14 +833,18 @@ class NipapXMLRPC:
         """
 
         try:
-            return self.nip.smart_search_asn(args.get('auth'),
-                args.get('query_string'), args.get('search_options') or {},
-                args.get('extra_query'))
+            return self.nip.smart_search_asn(
+                args.get('auth'),
+                args.get('query_string'),
+                args.get('search_options') or {},
+                args.get('extra_query'),
+            )
         except (AuthError, NipapError) as exc:
-            self.logger.debug(unicode(exc))
-            raise Fault(exc.error_code, unicode(exc))
-
+            self.logger.debug(str(exc))
+            raise Fault(exc.error_code, str(exc))
 
 
 if __name__ == '__main__':
+    if 'app' not in locals() and 'app' not in globals():
+        app = current_app()
     app.run()
