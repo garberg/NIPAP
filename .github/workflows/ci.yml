@@ -38,6 +38,7 @@ jobs:
 
         # Install dependencies for build and test
         sudo apt install -y \
+          build-essential \
           devscripts \
           fakeroot \
           debhelper \
